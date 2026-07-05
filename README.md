@@ -1,3 +1,5 @@
+!!! Another stupid vibe coding experiment
+
 # Super Source Layout Builder for OBS
 
 A web-based, H2R-Layouts-style "SuperSource" layout builder that drives **OBS Studio**
@@ -32,7 +34,7 @@ browser source…). That content is the "variable" part; layouts just position t
 ## Switching during a show
 - In the app: **Take** sends the current layout to OBS Program; the **Switch** box has a
   button per saved layout to take it straight to Program.
-- In Companion: see [COMPANION.md](COMPANION.md) — one button per layout scene.
+- In Companion: one button per layout scene.
 
 ## How it maps onto OBS
 - A box `{pos, size, crop}` (normalized 0–1) → scene-item transform with
