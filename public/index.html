@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Super Source Layout Builder</title>
+  <link rel="stylesheet" href="/editor.css" />
+</head>
+<body>
+  <main>
+    <section class="stage">
+      <div id="canvas" class="canvas"></div>
+    </section>
+
+    <aside class="sidebar">
+      <fieldset>
+        <legend>Layouts</legend>
+        <input id="name" class="name" placeholder="Layout name" value="Layout" />
+        <div class="row buttons">
+          <button id="newBtn">New</button>
+          <button id="saveBtn">Save</button>
+          <button id="takeBtn" class="primary" title="Send the current layout to the OBS Program output">Take</button>
+        </div>
+        <select id="saved"></select>
+        <div class="row buttons">
+          <button id="openBtn">Open</button>
+          <button id="deleteBtn">Delete</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Switch</legend>
+        <div id="switchGrid" class="switch-grid"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Background</legend>
+        <input id="bgUrl" class="name" placeholder="Image URL (https://…) — art behind the boxes" />
+        <label class="row">Upload <input type="file" id="bgFile" accept="image/*" /></label>
+        <div class="row buttons">
+          <button id="bgClearBtn">Clear background</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Box effects</legend>
+        <label class="row">Corner radius <input type="range" id="fxRadius" min="0" max="200" value="0" /></label>
+        <label class="row">Border width <input type="range" id="fxBorder" min="0" max="50" value="0" /></label>
+        <label class="row">Border color <input type="color" id="fxBorderColor" value="#ffffff" /></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Snap</legend>
+        <label>Snap distance <input type="number" id="snapPx" min="0" max="200" step="1" value="15" /> px</label>
+        <p class="hint">Guides at center / edges. Hold <b>Shift</b> while resizing to keep aspect ratio. Set 0 to disable snapping.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Box / Slot <select id="slot"></select></legend>
+        <label class="row"><input type="checkbox" id="enabled" checked /> Enabled</label>
+        <label class="row"><input type="checkbox" id="lockAspect" /> Lock aspect ratio</label>
+
+        <div class="grid2">
+          <label>Pos X <input type="number" id="posX" min="0" step="1" /> px</label>
+          <label>Pos Y <input type="number" id="posY" min="0" step="1" /> px</label>
+          <label>Size W <input type="number" id="sizeW" min="0" step="1" /> px</label>
+          <label>Size H <input type="number" id="sizeH" min="0" step="1" /> px</label>
+        </div>
+
+        <div class="grid2">
+          <label>Crop L <input type="number" id="cropL" min="0" step="1" /> px</label>
+          <label>Crop R <input type="number" id="cropR" min="0" step="1" /> px</label>
+          <label>Crop T <input type="number" id="cropT" min="0" step="1" /> px</label>
+          <label>Crop B <input type="number" id="cropB" min="0" step="1" /> px</label>
+        </div>
+
+        <div class="row buttons">
+          <button id="copyBtn">Copy</button>
+          <button id="pasteBtn">Paste</button>
+        </div>
+      </fieldset>
+
+      <p class="hint">Drag boxes to move, drag the corner to resize. Arrow keys nudge (Shift = 10×).</p>
+      <p id="status" class="status-footer">connecting…</p>
+    </aside>
+  </main>
+
+  <script src="/editor.js"></script>
+</body>
+</html>

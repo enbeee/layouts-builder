@@ -1,0 +1,17 @@
+{
+  "name": "layouts-builder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "H2R-style SuperSource layout builder for OBS Studio",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "obs-websocket-js": "^5.0.6",
+    "sharp": "^0.35.2",
+    "ws": "^8.18.0"
+  }
+}
