@@ -1,4 +1,4 @@
-!!! Another stupid vibe coding experiment
+!!! Another stupid vibe coding experiment -- use at your own risk !!!
 
 # Super Source Layout Builder for OBS
 
