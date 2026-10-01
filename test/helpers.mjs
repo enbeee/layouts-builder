@@ -28,8 +28,9 @@ export async function openEditorSocket() {
   return ws;
 }
 
-// Strict type-matched request/reply helper (broadcasts are queued aside, not
-// matched by accident — learned the hard way).
+// Strict type-matched request/reply helper. A settle window before each request
+// lets straggler broadcasts from the previous one (e.g. newLayout's async 'saved')
+// land first, so they can't be mistaken for the reply.
 export function makeRpc(ws) {
   const inbox = [];
   const waiters = [];
@@ -44,7 +45,13 @@ export function makeRpc(ws) {
     const t = setTimeout(() => rej(new Error(`timeout waiting for ${types}`)), ms);
     waiters.push({ types, resolve: (m) => { clearTimeout(t); res(m); } });
   });
-  return (o, types) => { inbox.length = 0; ws.send(JSON.stringify(o)); return waitFor(Array.isArray(types) ? types : [types]); };
+  const rpc = async (o, types) => {
+    await new Promise((r) => setTimeout(r, 120));
+    inbox.length = 0;
+    ws.send(JSON.stringify(o));
+    return waitFor(Array.isArray(types) ? types : [types]);
+  };
+  return rpc;
 }
 
 export function skip(reason) {

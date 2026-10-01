@@ -296,6 +296,8 @@ async function onMessage(ws, msg) {
     }
 
     case 'deleteLayout': {
+      // A pending autosave would resurrect the file we're about to remove.
+      clearTimeout(autoSaveTimer);
       try {
         await fs.promises.unlink(layoutFile(msg.id));
       } catch (e) {
