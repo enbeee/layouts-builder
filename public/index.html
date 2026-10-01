@@ -7,30 +7,66 @@
   <link rel="stylesheet" href="/editor.css" />
 </head>
 <body>
+  <div class="topbar">
+    <span class="brand">Super Source Builder</span>
+    <input id="name" class="name" placeholder="Layout name" value="Layout" />
+    <button id="newBtn">New</button>
+    <button id="saveBtn">Save</button>
+    <button id="takeBtn" class="primary" title="Send the current layout to the OBS Program output">Take</button>
+    <span id="chipDirty" class="chip warn hidden" title="Unsaved changes">unsaved</span>
+    <span id="chipObs" class="chip">OBS…</span>
+    <span class="spacer"></span>
+    <button id="undoBtn" title="Undo (Ctrl+Z)">↶</button>
+    <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">↷</button>
+    <label class="tb-label">Template
+      <select id="templateSel">
+        <option value="grid2x2">2×2 grid</option>
+        <option value="pipRight">Big + 3 PiP right</option>
+        <option value="thirds">Thirds</option>
+        <option value="focusStrip">Focus + bottom strip</option>
+        <option value="corners">Big + corner PiPs</option>
+      </select>
+    </label>
+    <button id="applyTemplateBtn" title="Replace the current layout with the template">Apply</button>
+  </div>
+
   <main>
     <section class="stage">
-      <div id="canvas" class="canvas"></div>
+      <div id="canvas" class="canvas">
+        <div id="bgLayer" class="bg-layer"></div>
+        <img id="obsPreview" class="obs-preview hidden" alt="OBS preview" draggable="false" />
+      </div>
+      <div class="stage-toolbar">
+        <button id="shotBtn" title="Fetch a live screenshot of this layout from OBS">OBS preview</button>
+        <label><input type="checkbox" id="shotAuto" /> auto</label>
+        <label>opacity <input type="range" id="shotOpacity" min="10" max="100" value="40" /></label>
+      </div>
     </section>
 
     <aside class="sidebar">
       <fieldset>
         <legend>Layouts</legend>
-        <input id="name" class="name" placeholder="Layout name" value="Layout" />
-        <div class="row buttons">
-          <button id="newBtn">New</button>
-          <button id="saveBtn">Save</button>
-          <button id="takeBtn" class="primary" title="Send the current layout to the OBS Program output">Take</button>
-        </div>
         <select id="saved"></select>
         <div class="row buttons">
           <button id="openBtn">Open</button>
+          <button id="dupBtn">Duplicate</button>
           <button id="deleteBtn">Delete</button>
+        </div>
+        <div class="row buttons">
+          <button id="exportBtn" title="Download the current layout as JSON">Export</button>
+          <label class="filebtn">Import <input type="file" id="importFile" accept="application/json,.json" hidden /></label>
         </div>
       </fieldset>
 
       <fieldset>
         <legend>Switch</legend>
         <div id="switchGrid" class="switch-grid"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Layers</legend>
+        <div id="layerList" class="layer-list"></div>
+        <p class="hint">Top of the list is in front. Order applies live in OBS.</p>
       </fieldset>
 
       <fieldset>
@@ -43,22 +79,10 @@
       </fieldset>
 
       <fieldset>
-        <legend>Box effects</legend>
-        <label class="row">Corner radius <input type="range" id="fxRadius" min="0" max="200" value="0" /></label>
-        <label class="row">Border width <input type="range" id="fxBorder" min="0" max="50" value="0" /></label>
-        <label class="row">Border color <input type="color" id="fxBorderColor" value="#ffffff" /></label>
-      </fieldset>
-
-      <fieldset>
-        <legend>Snap</legend>
-        <label>Snap distance <input type="number" id="snapPx" min="0" max="200" step="1" value="15" /> px</label>
-        <p class="hint">Guides at center / edges. Hold <b>Shift</b> while resizing to keep aspect ratio. Set 0 to disable snapping.</p>
-      </fieldset>
-
-      <fieldset>
         <legend>Box / Slot <select id="slot"></select></legend>
         <label class="row"><input type="checkbox" id="enabled" checked /> Enabled</label>
         <label class="row"><input type="checkbox" id="lockAspect" /> Lock aspect ratio</label>
+        <label class="row">Rotation <input type="number" id="rotation" min="-180" max="180" step="1" value="0" /> °</label>
 
         <div class="grid2">
           <label>Pos X <input type="number" id="posX" min="0" step="1" /> px</label>
@@ -73,6 +97,20 @@
           <label>Crop T <input type="number" id="cropT" min="0" step="1" /> px</label>
           <label>Crop B <input type="number" id="cropB" min="0" step="1" /> px</label>
         </div>
+        <p class="hint">Yellow crop lines are draggable.</p>
+
+        <div class="grid3 align-grid">
+          <button data-align="left" title="Align left edges">⇤</button>
+          <button data-align="centerX" title="Center horizontally">⇔</button>
+          <button data-align="right" title="Align right edges">⇥</button>
+          <button data-align="top" title="Align top edges">⇧</button>
+          <button data-align="centerY" title="Center vertically">⇕</button>
+          <button data-align="bottom" title="Align bottom edges">⇩</button>
+        </div>
+        <div class="row buttons">
+          <button id="distributeX" title="Distribute evenly horizontally">Dist ↔</button>
+          <button id="distributeY" title="Distribute evenly vertically">Dist ↕</button>
+        </div>
 
         <div class="row buttons">
           <button id="copyBtn">Copy</button>
@@ -80,10 +118,55 @@
         </div>
       </fieldset>
 
-      <p class="hint">Drag boxes to move, drag the corner to resize. Arrow keys nudge (Shift = 10×).</p>
-      <p id="status" class="status-footer">connecting…</p>
+      <fieldset>
+        <legend>Style</legend>
+        <label class="row">Corner radius <input type="range" id="stRadius" min="0" max="200" value="0" /> <span class="val" id="stRadiusV">0</span></label>
+        <label class="row">Box opacity <input type="range" id="stOpacity" min="0" max="100" value="100" /> <span class="val" id="stOpacityV">100</span></label>
+
+        <details open>
+          <summary>Border</summary>
+          <label class="row">Width <input type="range" id="stBorderW" min="0" max="50" value="0" /> <span class="val" id="stBorderWV">0</span></label>
+          <label class="row">Color <input type="color" id="stBorderColor" value="#ffffff" />
+            Opacity <input type="range" id="stBorderO" min="0" max="100" value="100" /></label>
+        </details>
+
+        <details>
+          <summary>Drop shadow</summary>
+          <label class="row">Opacity <input type="range" id="stShadowO" min="0" max="100" value="0" /> <span class="val" id="stShadowOV">0</span></label>
+          <label class="row">Blur <input type="range" id="stShadowBlur" min="0" max="100" value="16" /></label>
+          <label class="row">Spread <input type="range" id="stShadowSpread" min="0" max="50" value="0" /></label>
+          <div class="grid2">
+            <label>Offset X <input type="number" id="stShadowX" step="1" value="0" /> px</label>
+            <label>Offset Y <input type="number" id="stShadowY" step="1" value="12" /> px</label>
+          </div>
+          <label class="row">Color <input type="color" id="stShadowColor" value="#000000" /></label>
+        </details>
+        <p class="hint">Applied per box, live in OBS via alpha shaders — real soft shadows, correct overlaps.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Snap</legend>
+        <label>Snap distance <input type="number" id="snapPx" min="0" max="200" step="1" value="15" /> px</label>
+        <p class="hint">Snaps to canvas edges/center, other boxes' edges/centers, and (while resizing) half-size marks. Hold <b>Shift</b> to keep aspect ratio. 0 disables.</p>
+      </fieldset>
+
+      <button id="logoutBtn" class="linklike" title="Forget the access token on this device">forget token</button>
     </aside>
   </main>
+
+  <div id="toasts"></div>
+
+  <div id="tokenModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>Access token</h3>
+      <p class="hint">Paste the token printed by the server on startup (or open the editor via the quick-open URL).</p>
+      <input id="tokenInput" class="name" placeholder="access token" autocomplete="off" />
+      <div class="row buttons">
+        <button id="tokenSave" class="primary">Connect</button>
+      </div>
+      <p id="tokenError" class="hint error"></p>
+    </div>
+  </div>
 
   <script src="/editor.js"></script>
 </body>
