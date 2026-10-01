@@ -1,14 +1,28 @@
 [Unit]
 Description=Super Source Layout Builder for OBS
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=enbee
 WorkingDirectory=/home/enbee/layouts-builder
-ExecStart=/home/enbee/.nvm/versions/node/v25.9.0/bin/node server.js
+# Credentials + EDITOR_TOKEN live in /etc/default/layouts-builder (mode 600):
+#   OBS_HOST=10.0.0.10
+#   OBS_PORT=4455
+#   OBS_PASSWORD=...
+#   EDITOR_TOKEN=...        (openssl rand -base64 24; EDITOR_TOKEN='' disables auth)
+ExecStart=/usr/bin/env node server.js
+EnvironmentFile=/etc/default/layouts-builder
 Restart=on-failure
 RestartSec=3
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/enbee/layouts-builder/layouts /home/enbee/layouts-builder/bgs /home/enbee/layouts-builder/.editor-token
 
 [Install]
 WantedBy=multi-user.target

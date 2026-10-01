@@ -6,7 +6,8 @@
   "description": "H2R-style SuperSource layout builder for OBS Studio",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/run-all.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",

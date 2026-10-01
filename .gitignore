@@ -1,0 +1,9 @@
+node_modules/
+bgs/*
+!bgs/.gitkeep
+layouts/*
+!layouts/.gitkeep
+credentials.md
+.editor-token
+*.log
+.DS_Store
