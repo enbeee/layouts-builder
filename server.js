@@ -6,36 +6,145 @@ import express from 'express';
 import sharp from 'sharp';
 import { WebSocketServer } from 'ws';
 import {
-  connect, onConnectionClosed, getVideoSettings, ensureSlots, getSceneList, slotNames,
-  createLayout, setBoxTransform, setItemEnabled, removeScene, switchToProgram, ensureBackground,
-  layoutName,
+  connect, onConnectionClosed, isConnected, getVideoSettings, ensureSlots, getSceneList, slotNames,
+  createLayout, setBoxTransform, setItemEnabled, reorderLayoutItems, removeScene, removeBackgroundInput,
+  switchToProgram, ensureBackground, layoutName, getSourceScreenshot, enqueue,
 } from './obs.js';
-import { applySourceEffects, updateSlotCrop, cleanBoxEffects } from './effects.js';
-import { blankLayout, nameToId, normalizeBoxes, clampCrop } from './layouts.js';
-import { editorPort, overlayBaseUrl } from './config.js';
+import { applySlotEffects, syncSlotEffects, cleanBoxEffects } from './effects.js';
+import {
+  blankLayout, nameToId, isValidId, normalizeLayout,
+} from './layouts.js';
+import { editorPort, bindAddress, editorToken, authEnabled, obsConfigured } from './config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LAYOUTS_DIR = path.join(__dirname, 'layouts');
+const BGS_DIR = path.join(__dirname, 'bgs');
 fs.mkdirSync(LAYOUTS_DIR, { recursive: true });
+fs.mkdirSync(BGS_DIR, { recursive: true });
+
+const MASK_SHADER = fs.readFileSync(path.join(__dirname, 'shaders', 'boxfx_mask.shader'), 'utf8');
+const SHADOW_SHADER = fs.readFileSync(path.join(__dirname, 'shaders', 'boxfx_shadow.shader'), 'utf8');
+const MAX_BG_BYTES = 10 * 1024 * 1024;
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '15mb' }));
 // Never cache the UI assets — the editor changes often and stale JS causes confusing bugs.
-app.use(express.static('public', {
+app.use(express.static(path.join(__dirname, 'public'), {
   etag: false,
   lastModified: false,
   setHeaders: (res) => res.set('Cache-Control', 'no-store'),
 }));
 
-// Background art: served to OBS as a browser source.
-const BGS_DIR = path.join(__dirname, 'bgs');
-fs.mkdirSync(BGS_DIR, { recursive: true });
-const BOXFX_SHADER = fs.readFileSync(path.join(__dirname, 'shaders', 'boxfx_chroma.shader'), 'utf8');
-app.use('/bg', express.static(BGS_DIR));
+// --- auth -------------------------------------------------------------------
+// Editor UI + /bg images stay open; every /api route and the WebSocket require the
+// token (URL query or Authorization: Bearer). Disable with EDITOR_TOKEN=''.
+function requestToken(req) {
+  if (!authEnabled) return true;
+  const q = new URL(req.url, 'http://localhost').searchParams.get('token');
+  const h = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  return q === editorToken || h === editorToken;
+}
+app.use('/api', (req, res, next) => {
+  if (requestToken(req)) return next();
+  res.status(401).json({ error: 'unauthorized: missing or invalid token' });
+});
 
-// Resolve a background src into a data: URL the OBS browser source can render with no
-// network fetch. Uploaded images are resized to the canvas (cover) via sharp so they
-// fill the frame at any original dimensions; http(s) URLs pass through as-is.
+// Background art: served to OBS as a browser source. Re-encoded at upload time, so
+// only real images exist here (no HTML/SVG upload → no stored XSS).
+app.use('/bg', express.static(BGS_DIR, { setHeaders: (res) => res.set('X-Content-Type-Options', 'nosniff') }));
+
+let canvas = { width: 1920, height: 1080 };
+let current = null; // normalized layout + runtime fields (scene, items)
+
+// --- persistence ---------------------------------------------------------
+
+function layoutFile(id) {
+  // id is validated against /^[a-z0-9][a-z0-9-]{0,63}$/ by every caller; this is
+  // defense in depth for the path join itself.
+  if (!isValidId(id)) throw new Error(`invalid layout id: ${JSON.stringify(String(id).slice(0, 40))}`);
+  return path.join(LAYOUTS_DIR, `${id}.json`);
+}
+
+async function listSaved() {
+  let files;
+  try { files = await fs.promises.readdir(LAYOUTS_DIR); } catch { return []; }
+  const out = [];
+  for (const f of files.filter((n) => n.endsWith('.json'))) {
+    try {
+      const data = JSON.parse(await fs.promises.readFile(path.join(LAYOUTS_DIR, f), 'utf8'));
+      out.push({ id: data.id || f.replace(/\.json$/, ''), name: data.name || data.id || f });
+    } catch { /* corrupt file — surfaced by name only */ }
+  }
+  return out;
+}
+
+async function saveLayoutFile(layout) {
+  const { id, name, version, boxes, bg, order } = layout;
+  const file = layoutFile(id);
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  await fs.promises.writeFile(tmp, JSON.stringify({ id, name, version, boxes, bg, order }, null, 2));
+  await fs.promises.rename(tmp, file); // atomic on POSIX: no torn JSON files
+  return id;
+}
+
+async function loadLayoutFile(id) {
+  const data = JSON.parse(await fs.promises.readFile(layoutFile(id), 'utf8'));
+  const layout = normalizeLayout(data);
+  layout.id = id; // the filename is authoritative
+  return layout;
+}
+
+// --- OBS sync ------------------------------------------------------------
+
+async function applyLayoutToObs(layout) {
+  // Editor-only mode (or OBS blip): keep the layout open locally, sync later on reconnect.
+  if (!isConnected()) {
+    layout.scene = layoutName(layout.name);
+    layout.items = {};
+    return;
+  }
+  const { scene, items } = await createLayout(layout.name);
+  layout.scene = scene;
+  layout.items = items;
+  for (const b of layout.boxes) {
+    if (items[b.slot] != null) {
+      await enqueue(() => setBoxTransform(scene, items[b.slot], b, canvas));
+      await enqueue(() => setItemEnabled(scene, items[b.slot], b.enabled));
+    }
+  }
+  await enqueue(() => reorderLayoutItems(scene, items, layout.order));
+  const bgUrl = layout.bg && layout.bg.src ? await resolveBg(layout.bg.src) : null;
+  await enqueue(() => ensureBackground(layout, canvas, bgUrl));
+  await enqueue(() => applySlotEffects(layout, canvas, MASK_SHADER, SHADOW_SHADER));
+}
+
+function publicLayout(l) {
+  if (!l) return null;
+  const { id, name, boxes, bg, order, version } = l;
+  return { id, name, boxes, bg, order, version };
+}
+
+// Generate a non-colliding name for a brand-new layout.
+async function uniqueName(base) {
+  const ids = new Set((await listSaved()).map((s) => s.id));
+  if (!ids.has(nameToId(base))) return base;
+  let i = 2;
+  while (ids.has(nameToId(`${base} ${i}`))) i++;
+  return `${base} ${i}`;
+}
+
+// Debounced auto-save: persists the current layout shortly after edits stop.
+let autoSaveTimer = null;
+function scheduleAutosave() {
+  if (!current || !current.id) return;
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(() => {
+    saveLayoutFile(current).catch((e) => console.warn('[server] autosave failed:', e.message));
+  }, 700);
+}
+
+// --- background upload -----------------------------------------------------
+
 async function resolveBg(src) {
   if (!src) return null;
   if (/^https?:\/\//.test(src)) return src;
@@ -53,103 +162,37 @@ async function resolveBg(src) {
     return null;
   }
 }
-app.post('/api/bg', (req, res) => {
-  const { name, data } = req.body || {};
-  if (!name || !data) return res.status(400).json({ error: 'name and data required' });
-  const safe = String(name).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
+
+app.post('/api/bg', async (req, res) => {
   try {
-    fs.writeFileSync(path.join(BGS_DIR, safe), Buffer.from(data, 'base64'));
-    res.json({ src: `/bg/${encodeURIComponent(safe)}` });
+    const { name, data } = req.body || {};
+    if (!name || !data) return res.status(400).json({ error: 'name and data required' });
+    const buf = Buffer.from(String(data), 'base64');
+    if (!buf.length) return res.status(400).json({ error: 'data is not valid base64' });
+    if (buf.length > MAX_BG_BYTES) return res.status(413).json({ error: 'image too large (max 10 MB)' });
+    // Re-encode through sharp: rejects non-images, strips metadata/payloads, and the
+    // stored file is always a JPEG served as image/jpeg.
+    const stem = String(name).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80).replace(/\.[^.]*$/, '').replace(/^\.+/, '') || 'bg';
+    const file = `${stem}-${Date.now()}.jpg`;
+    await sharp(buf)
+      .resize(3840, 3840, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 88 })
+      .toFile(path.join(BGS_DIR, file));
+    res.json({ src: `/bg/${encodeURIComponent(file)}` });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(400).json({ error: `invalid image: ${e.message}` });
   }
 });
 
-let canvas = { width: 1920, height: 1080 };
-let current = null; // { id, name, boxes, scene, items }
-
-// --- persistence ---------------------------------------------------------
-
-function layoutFile(id) {
-  return path.join(LAYOUTS_DIR, `${id}.json`);
-}
-
-function listSaved() {
-  return fs.readdirSync(LAYOUTS_DIR)
-    .filter((f) => f.endsWith('.json'))
-    .map((f) => {
-      try {
-        const data = JSON.parse(fs.readFileSync(path.join(LAYOUTS_DIR, f), 'utf8'));
-        return { id: data.id || f.replace(/\.json$/, ''), name: data.name || data.id || f };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-}
-
-function saveLayoutFile(layout) {
-  const { id, name, boxes, bg, effects } = layout;
-  fs.writeFileSync(layoutFile(id), JSON.stringify({ id, name, boxes, bg, effects }, null, 2));
-  return id;
-}
-
-function loadLayoutFile(id) {
-  const data = JSON.parse(fs.readFileSync(layoutFile(id), 'utf8'));
-  data.id = id;
-  data.boxes = normalizeBoxes(data);
-  data.boxes.forEach(clampCrop);
-  data.bg = data.bg && data.bg.src ? data.bg : null;
-  data.effects = data.effects || null;
-  return data;
-}
-
-// --- OBS sync ------------------------------------------------------------
-
-async function applyLayoutToObs(layout) {
-  const { scene, items } = await createLayout(layout.name);
-  layout.scene = scene;
-  layout.items = items;
-  for (const b of layout.boxes) {
-    clampCrop(b);
-    if (items[b.slot] != null) {
-      await setBoxTransform(scene, items[b.slot], b, canvas);
-      await setItemEnabled(scene, items[b.slot], b.enabled);
-    }
+app.delete('/api/bg/:name', async (req, res) => {
+  const name = path.basename(String(req.params.name));
+  try {
+    await fs.promises.unlink(path.join(BGS_DIR, name));
+    res.json({ ok: true });
+  } catch {
+    res.status(404).json({ error: 'no such background' });
   }
-  await ensureBackground(layout, canvas, layout.bg && layout.bg.src ? await resolveBg(layout.bg.src) : null);
-  if (layout.effects) await applySourceEffects(layout, canvas, BOXFX_SHADER);
-}
-
-function publicLayout(l) {
-  if (!l) return null;
-  const { id, name, boxes, bg, effects } = l;
-  return { id, name, boxes, bg, effects };
-}
-
-// Generate a non-colliding name for a brand-new layout.
-function uniqueName(base) {
-  const ids = new Set(listSaved().map((s) => s.id));
-  if (!ids.has(nameToId(base))) return base;
-  let i = 2;
-  while (ids.has(nameToId(`${base} ${i}`))) i++;
-  return `${base} ${i}`;
-}
-
-// Debounced auto-save: persists the current layout shortly after edits stop.
-let autoSaveTimer = null;
-function scheduleAutosave() {
-  if (!current || !current.id) return;
-  clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(() => {
-    try { saveLayoutFile(current); } catch (e) { console.warn('[server] autosave failed:', e.message); }
-  }, 700);
-}
-
-function broadcastSaved() {
-  const msg = JSON.stringify({ type: 'saved', saved: listSaved() });
-  for (const c of wss.clients) if (c.readyState === c.OPEN) c.send(msg);
-}
+});
 
 // --- WS ------------------------------------------------------------------
 
@@ -157,19 +200,35 @@ function send(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  for (const c of wss.clients) if (c.readyState === c.OPEN) c.send(msg);
+}
+
 async function statePayload() {
   let currentProgramScene = null;
-  try {
-    ({ currentProgramSceneName: currentProgramScene } = await getSceneList());
-  } catch { /* ignore */ }
+  if (isConnected()) {
+    try {
+      ({ currentProgramSceneName: currentProgramScene } = await getSceneList());
+    } catch { /* stale state is fine */ }
+  }
   return {
     type: 'state',
     canvas,
     slots: slotNames,
-    saved: listSaved(),
+    saved: await listSaved(),
     layout: publicLayout(current),
     currentProgramScene,
+    obs: { connected: isConnected(), configured: obsConfigured },
   };
+}
+
+function requireCurrent(ws) {
+  if (!current) {
+    send(ws, { type: 'error', error: 'no layout open — create or open one first' });
+    return false;
+  }
+  return true;
 }
 
 async function onMessage(ws, msg) {
@@ -179,19 +238,20 @@ async function onMessage(ws, msg) {
       break;
 
     case 'newLayout': {
-      const name = uniqueName(msg.name || 'Layout');
-      current = blankLayout(name);
-      await applyLayoutToObs(current);
-      saveLayoutFile(current);
+      const name = await uniqueName(msg.name || 'Layout');
+      current = msg.from ? await loadLayoutFile(msg.from) : blankLayout(name);
+      if (msg.from) { current.name = name; current.id = nameToId(name); }
+      try { await applyLayoutToObs(current); } catch (e) { send(ws, { type: 'error', error: `OBS sync failed: ${e.message}` }); }
+      await saveLayoutFile(current);
       send(ws, { type: 'layout', layout: publicLayout(current) });
-      broadcastSaved();
+      broadcast({ type: 'saved', saved: await listSaved() });
       break;
     }
 
     case 'open': {
       try {
-        current = loadLayoutFile(msg.id);
-        await applyLayoutToObs(current);
+        current = await loadLayoutFile(msg.id);
+        try { await applyLayoutToObs(current); } catch (e) { send(ws, { type: 'error', error: `OBS sync failed: ${e.message}` }); }
         send(ws, { type: 'layout', layout: publicLayout(current) });
       } catch (e) {
         send(ws, { type: 'error', error: `Could not open layout: ${e.message}` });
@@ -199,65 +259,115 @@ async function onMessage(ws, msg) {
       break;
     }
 
-    case 'save': {
-      if (!current) break;
-      if (msg.name) { current.name = msg.name; current.id = nameToId(msg.name); }
-      saveLayoutFile(current);
-      send(ws, { type: 'saved', id: current.id, name: current.name, saved: listSaved() });
-      break;
-    }
-
-    case 'deleteLayout': {
-      try { fs.unlinkSync(layoutFile(msg.id)); } catch { /* ignore */ }
-      try { await removeScene(layoutName(msg.name || msg.id)); } catch { /* ignore */ }
-      send(ws, { type: 'saved', id: null, saved: listSaved() });
-      break;
-    }
-
-    case 'setBox': {
-      if (!current) break;
-      const { slot, box } = msg;
-      const idx = current.boxes.findIndex((b) => b.slot === slot);
-      if (idx < 0) break;
-      const prevEnabled = current.boxes[idx].enabled;
-      current.boxes[idx] = { ...current.boxes[idx], ...box, slot };
-      const full = current.boxes[idx];
-      clampCrop(full);
-      if (current.items && current.items[slot] != null) {
-        await setBoxTransform(current.scene, current.items[slot], full, canvas);
-        if (full.enabled !== prevEnabled) await setItemEnabled(current.scene, current.items[slot], full.enabled);
-      }
-      send(ws, { type: 'box', slot, box: full });
-      if (current.effects && (current.effects.corner_radius || current.effects.border_width)) {
-        await updateSlotCrop(current, slot, canvas);
-      }
-      scheduleAutosave();
-      break;
-    }
-
-    case 'setBackground': {
-      if (!current) break;
-      current.bg = msg.src ? { src: msg.src } : null;
-      await ensureBackground(current, canvas, current.bg ? await resolveBg(current.bg.src) : null);
+    // Full replace of the current layout (templates, import, undo/redo).
+    case 'setLayout': {
+      if (!requireCurrent(ws)) break;
+      const next = normalizeLayout({ ...msg.layout, id: current.id, name: msg.layout?.name || current.name });
+      current = next;
+      try { await applyLayoutToObs(current); } catch (e) { send(ws, { type: 'error', error: `OBS sync failed: ${e.message}` }); }
       send(ws, { type: 'layout', layout: publicLayout(current) });
       scheduleAutosave();
       break;
     }
 
-    case 'setEffects': {
-      if (!current) break;
-      current.effects = current.effects || {};
-      Object.assign(current.effects, msg.effects);
-      await applySourceEffects(current, canvas, BOXFX_SHADER);
+    case 'importLayout': {
+      const layout = normalizeLayout(msg.layout || {});
+      layout.name = await uniqueName(layout.name);
+      layout.id = nameToId(layout.name);
+      current = layout;
+      try { await applyLayoutToObs(current); } catch (e) { send(ws, { type: 'error', error: `OBS sync failed: ${e.message}` }); }
+      await saveLayoutFile(current);
+      send(ws, { type: 'layout', layout: publicLayout(current) });
+      broadcast({ type: 'saved', saved: await listSaved() });
+      break;
+    }
+
+    case 'save': {
+      if (!requireCurrent(ws)) break;
+      const oldId = current.id;
+      if (msg.name) { current.name = String(msg.name).slice(0, 80); current.id = nameToId(current.name); }
+      await saveLayoutFile(current);
+      if (msg.name && current.id !== oldId) {
+        // renamed: drop the stale file under the old id
+        try { await fs.promises.unlink(layoutFile(oldId)); } catch { /* wasn't saved yet */ }
+      }
+      send(ws, { type: 'saved', id: current.id, name: current.name, saved: await listSaved() });
+      break;
+    }
+
+    case 'deleteLayout': {
+      try {
+        await fs.promises.unlink(layoutFile(msg.id));
+      } catch (e) {
+        send(ws, { type: 'error', error: `Could not delete: ${e.message}` });
+        break;
+      }
+      const name = String(msg.name || msg.id);
+      try { await enqueue(() => removeScene(layoutName(name))); } catch { /* scene absent */ }
+      try { await enqueue(() => removeBackgroundInput(name)); } catch { /* input absent */ }
+      broadcast({ type: 'saved', id: null, saved: await listSaved() });
+      break;
+    }
+
+    case 'setBox': {
+      if (!requireCurrent(ws)) break;
+      const { slot, box } = msg;
+      const idx = current.boxes.findIndex((b) => b.slot === slot);
+      if (idx < 0) { send(ws, { type: 'error', error: `no slot ${slot}` }); break; }
+      const prevEnabled = current.boxes[idx].enabled;
+      current.boxes[idx] = { ...current.boxes[idx], ...box, slot };
+      normalizeLayout(current); // revalidates every box (incl. style) in place
+      const full = current.boxes[idx];
+      if (isConnected() && current.items && current.items[slot] != null) {
+        await enqueue(() => setBoxTransform(current.scene, current.items[slot], full, canvas));
+        if (full.enabled !== prevEnabled) {
+          await enqueue(() => setItemEnabled(current.scene, current.items[slot], full.enabled));
+        }
+      }
+      if (isConnected()) {
+        await enqueue(() => syncSlotEffects(current, slot, canvas, MASK_SHADER, SHADOW_SHADER));
+      }
+      send(ws, { type: 'box', slot, box: full });
+      scheduleAutosave();
+      break;
+    }
+
+    // order: slot numbers bottom → top (index 0 stays the background).
+    case 'reorder': {
+      if (!requireCurrent(ws)) break;
+      const order = Array.isArray(msg.order) ? msg.order.map(Number) : [];
+      const valid = order.filter((s) => current.boxes.some((b) => b.slot === s));
+      for (const b of current.boxes) if (!valid.includes(b.slot)) valid.push(b.slot);
+      current.order = valid;
+      if (current.scene && current.items) {
+        await enqueue(() => reorderLayoutItems(current.scene, current.items, current.order));
+      }
+      send(ws, { type: 'layout', layout: publicLayout(current) });
+      scheduleAutosave();
+      break;
+    }
+
+    case 'setBackground': {
+      if (!requireCurrent(ws)) break;
+      current.bg = msg.src ? { src: String(msg.src).slice(0, 500) } : null;
+      if (isConnected()) {
+        try {
+          const bgUrl = current.bg ? await resolveBg(current.bg.src) : null;
+          await enqueue(() => ensureBackground(current, canvas, bgUrl));
+        } catch (e) {
+          send(ws, { type: 'error', error: `OBS sync failed: ${e.message}` });
+        }
+      }
       send(ws, { type: 'layout', layout: publicLayout(current) });
       scheduleAutosave();
       break;
     }
 
     case 'switch': {
-      if (!current) break;
-      await switchToProgram(current.scene);
+      if (!requireCurrent(ws)) break;
+      await enqueue(() => switchToProgram(current.scene));
       send(ws, { type: 'switched', scene: current.scene });
+      broadcast({ type: 'switched', scene: current.scene });
       break;
     }
 
@@ -265,27 +375,47 @@ async function onMessage(ws, msg) {
       // Apply (creating the scene if needed) then put on program, without replacing
       // the layout open in the editor.
       try {
-        const layout = loadLayoutFile(msg.id);
+        const layout = await loadLayoutFile(msg.id);
         await applyLayoutToObs(layout);
-        await switchToProgram(layout.scene);
+        await enqueue(() => switchToProgram(layout.scene));
         send(ws, { type: 'switched', scene: layout.scene });
+        broadcast({ type: 'switched', scene: layout.scene });
       } catch (e) {
         send(ws, { type: 'error', error: `Could not switch: ${e.message}` });
       }
       break;
     }
 
-    default:
+    case 'screenshot': {
+      try {
+        if (!isConnected()) throw new Error('OBS is not connected');
+        const scene = msg.scene || current?.scene;
+        if (!scene) throw new Error('no layout open');
+        const data = await getSourceScreenshot(scene, { format: 'jpeg', quality: 70, width: 1280 });
+        send(ws, { type: 'screenshot', data });
+      } catch (e) {
+        send(ws, { type: 'error', error: `screenshot failed: ${e.message}` });
+      }
       break;
+    }
+
+    default:
+      send(ws, { type: 'error', error: `unknown message type: ${String(msg.type).slice(0, 40)}` });
   }
 }
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, 'http://localhost');
+  if (!requestToken({ url: req.url, headers: req.headers })) {
+    send(ws, { type: 'error', error: 'unauthorized: missing or invalid token' });
+    ws.close(4001, 'unauthorized');
+    return;
+  }
   ws.on('message', (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
+    try { msg = JSON.parse(data.toString()); } catch { send(ws, { type: 'error', error: 'invalid JSON' }); return; }
     onMessage(ws, msg).catch((e) => send(ws, { type: 'error', error: e?.message || String(e) }));
   });
 });
@@ -293,6 +423,7 @@ wss.on('connection', (ws) => {
 app.get('/api/state', async (_req, res) => res.json(await statePayload()));
 
 // Connect to OBS with timeout + retry, re-applying the current layout on (re)connect.
+// With no OBS credentials the server runs in editor-only mode (layouts still save).
 let connecting = false;
 let effectsCleaned = false;
 async function connectLoop() {
@@ -311,11 +442,13 @@ async function connectLoop() {
         await ensureSlots();
         if (!effectsCleaned) { await cleanBoxEffects(); effectsCleaned = true; }
         console.log('[obs] slots ready');
+        broadcast({ type: 'obsStatus', connected: true, configured: true });
         if (current) {
           try { await applyLayoutToObs(current); } catch (e) { console.warn('[obs] reapply failed:', e.message); }
         }
         return;
       } catch (e) {
+        broadcast({ type: 'obsStatus', connected: false, configured: true });
         console.error('[obs] connect failed, retrying in 3s:', e?.message || e);
         await new Promise((r) => setTimeout(r, 3000));
       }
@@ -327,9 +460,22 @@ async function connectLoop() {
 
 async function main() {
   // Serve the UI immediately, even before OBS is reachable.
-  server.listen(editorPort, () => console.log(`[server] editor: http://localhost:${editorPort}`));
+  server.listen(editorPort, bindAddress, () => {
+    const display = bindAddress === '0.0.0.0' ? `<this-host-ip>` : bindAddress;
+    console.log(`[server] editor: http://localhost:${editorPort} (also bound to ${display})`);
+    if (authEnabled) {
+      console.log(`[server] token: ${editorToken}`);
+      console.log(`[server] quick open: http://localhost:${editorPort}/?token=${editorToken}`);
+    } else {
+      console.log('[server] auth DISABLED (EDITOR_TOKEN="") — anyone on the network can control this app');
+    }
+  });
   onConnectionClosed(() => { console.log('[obs] lost — reconnecting…'); connectLoop(); });
-  connectLoop();
+  if (obsConfigured) {
+    connectLoop();
+  } else {
+    console.log('[server] OBS not configured (no credentials.md / env vars) — editor-only mode');
+  }
 }
 
 main().catch((e) => {
